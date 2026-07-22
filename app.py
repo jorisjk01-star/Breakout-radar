@@ -21,6 +21,13 @@ import streamlit as st
 import yfinance as yf
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import streamlit.components.v1 as components
+
+try:
+    from streamlit_autorefresh import st_autorefresh
+    _HAS_AUTOREFRESH = True
+except ImportError:
+    _HAS_AUTOREFRESH = False
 
 warnings.filterwarnings("ignore")
 
@@ -37,10 +44,17 @@ st.set_page_config(
 
 CACHE_TTL = 60  # seconden - ververst elke minuut
 
-DEFAULT_TICKERS = [
+# Vaste back-uplijst: wordt alleen gebruikt als de automatische live-screener
+# (Yahoo Finance) een keer niet bereikbaar is, zodat de app nooit leeg staat.
+FALLBACK_TICKERS = [
     "DFNS", "CPHI", "VIVK", "KIDZ", "JUNS",
     "SOUN", "BBAI", "HOLO", "MVIS", "MULN",
 ]
+
+# Voorgedefinieerde, gratis Yahoo Finance-screeners die we combineren om
+# automatisch kandidaten te vinden — geen API key nodig.
+SCREEN_NAMES = ["day_gainers", "most_actives", "small_cap_gainers", "aggressive_small_caps"]
+MICRO_CAP_MAX_MARKETCAP = 500_000_000  # $500M grens voor "micro-cap"
 
 # Kleine CSS-tweak zodat het ook prettig oogt op mobiel (iPhone/Safari)
 st.markdown(
@@ -91,6 +105,55 @@ def fetch_news(ticker: str) -> list:
         return news if isinstance(news, list) else []
     except Exception:
         return []
+
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def discover_micro_cap_candidates(max_price: float = 10.0, max_results: int = 20):
+    """
+    Zoekt automatisch potentiële micro-cap/penny-stock kandidaten via de
+    gratis voorgedefinieerde screeners van Yahoo Finance (geen API key nodig).
+    Combineert 'day_gainers', 'most_actives', 'small_cap_gainers' en
+    'aggressive_small_caps', filtert op prijs en marktkapitalisatie.
+
+    Retourneert (lijst_met_tickers, gelukt: bool). Bij een fout of lege
+    respons wordt teruggevallen op FALLBACK_TICKERS en gelukt=False,
+    zodat de app nooit zonder tickers komt te zitten.
+    """
+    found, seen = [], set()
+    any_screen_worked = False
+
+    for name in SCREEN_NAMES:
+        try:
+            result = yf.screen(name, count=50)
+            quotes = result.get("quotes", []) if isinstance(result, dict) else []
+            if quotes:
+                any_screen_worked = True
+        except Exception:
+            quotes = []
+
+        for q in quotes:
+            symbol = q.get("symbol")
+            price = q.get("regularMarketPrice")
+            market_cap = q.get("marketCap")
+
+            if not symbol or symbol in seen:
+                continue
+            if price is not None and price > max_price:
+                continue
+            if market_cap is not None and market_cap > MICRO_CAP_MAX_MARKETCAP:
+                continue
+
+            seen.add(symbol)
+            found.append(symbol)
+            if len(found) >= max_results:
+                break
+        if len(found) >= max_results:
+            break
+
+    if not any_screen_worked or not found:
+        return FALLBACK_TICKERS.copy(), False
+
+    return found[:max_results], True
 
 
 # =============================================================================
@@ -392,40 +455,103 @@ def score_color(score):
     return "🔴"
 
 
+def render_refresh_timer(ttl_seconds: int, last_refresh: datetime):
+    """Toont een live (client-side) countdown tot de volgende databerekening."""
+    html = f"""
+    <div style="font-family: -apple-system, sans-serif; text-align:center; padding:4px 0 10px 0;">
+      <span style="font-size:0.8rem; color:#888;">
+        🕐 Laatste update: {last_refresh.strftime('%H:%M:%S')}
+      </span>
+      &nbsp;·&nbsp;
+      <span id="countdown" style="font-size:0.95rem; font-weight:600; color:#26a69a;"></span>
+    </div>
+    <script>
+      let remaining = {ttl_seconds};
+      const el = document.getElementById("countdown");
+      function tick() {{
+        if (remaining <= 0) {{
+          el.innerText = "🔄 Data wordt ververst...";
+          return;
+        }}
+        el.innerText = "volgende update over " + remaining + "s";
+        remaining -= 1;
+        setTimeout(tick, 1000);
+      }}
+      tick();
+    </script>
+    """
+    components.html(html, height=40)
+
+
 # =============================================================================
 # 7. SIDEBAR
 # =============================================================================
 
 st.sidebar.title("🚀 Breakout Radar")
-st.sidebar.caption("Instellingen & tickerlijst")
+st.sidebar.caption("Instellingen")
 
-if "tickers" not in st.session_state:
-    st.session_state.tickers = DEFAULT_TICKERS.copy()
+# --- Automatische live-herberekening (geen klik nodig) ------------------
+if _HAS_AUTOREFRESH:
+    st_autorefresh(interval=CACHE_TTL * 1000, key="auto_refresh_timer")
 
-selected = st.sidebar.multiselect(
-    "Actieve tickers",
-    options=sorted(set(st.session_state.tickers + DEFAULT_TICKERS)),
-    default=st.session_state.tickers,
+if "last_refresh" not in st.session_state:
+    st.session_state.last_refresh = datetime.now()
+st.session_state.last_refresh = datetime.now()  # elke (auto-)rerun = nieuwe cyclus
+
+# --- Scanmodus: standaard automatisch, geen handmatig werk nodig --------
+st.sidebar.subheader("🔎 Welke aandelen scannen?")
+scan_mode = st.sidebar.radio(
+    "Scanmodus",
+    ["🤖 Automatisch ontdekken (aanbevolen)", "✍️ Handmatige lijst"],
+    index=0,
+    label_visibility="collapsed",
 )
 
-extra = st.sidebar.text_input(
-    "Extra tickers toevoegen (komma-gescheiden)",
-    placeholder="bv. NVOS, ATNF",
-)
-if extra:
-    new_tickers = [t.strip().upper() for t in extra.split(",") if t.strip()]
-    selected = list(dict.fromkeys(selected + new_tickers))
+max_price = st.sidebar.slider("Max. prijs per aandeel ($)", 1.0, 20.0, 10.0, step=0.5)
+n_scan = st.sidebar.slider("Aantal tickers om te scannen", 5, 40, 20, step=5)
 
-st.session_state.tickers = selected if selected else DEFAULT_TICKERS.copy()
+if scan_mode.startswith("🤖"):
+    discovered, ok = discover_micro_cap_candidates(max_price=max_price, max_results=n_scan)
+    st.session_state.tickers = discovered
+    if ok:
+        st.sidebar.success(f"✅ {len(discovered)} kandidaten live gevonden (Yahoo screeners).")
+    else:
+        st.sidebar.warning(
+            "⚠️ Live screener niet bereikbaar — teruggevallen op vaste back-uplijst."
+        )
+    with st.sidebar.expander("Gebruikte tickers bekijken"):
+        st.write(", ".join(st.session_state.tickers))
+else:
+    if "manual_tickers" not in st.session_state:
+        st.session_state.manual_tickers = FALLBACK_TICKERS.copy()
+
+    selected = st.sidebar.multiselect(
+        "Actieve tickers",
+        options=sorted(set(st.session_state.manual_tickers + FALLBACK_TICKERS)),
+        default=st.session_state.manual_tickers,
+    )
+    extra = st.sidebar.text_input(
+        "Extra tickers toevoegen (komma-gescheiden)", placeholder="bv. NVOS, ATNF"
+    )
+    if extra:
+        new_tickers = [t.strip().upper() for t in extra.split(",") if t.strip()]
+        selected = list(dict.fromkeys(selected + new_tickers))
+
+    st.session_state.manual_tickers = selected if selected else FALLBACK_TICKERS.copy()
+    st.session_state.tickers = st.session_state.manual_tickers
 
 if st.sidebar.button("🔄 Ververs data nu"):
     st.cache_data.clear()
+    st.session_state.last_refresh = datetime.now()
     st.rerun()
 
-st.sidebar.info(
-    f"Data wordt automatisch elke {CACHE_TTL} seconden herberekend "
-    "(gecachet via st.cache_data). Klik 'Ververs data' om direct te forceren."
-)
+if not _HAS_AUTOREFRESH:
+    st.sidebar.caption(
+        "ℹ️ Installeer `streamlit-autorefresh` voor automatische live-updates "
+        "zonder zelf te klikken (staat al in requirements.txt)."
+    )
+
+st.sidebar.info(f"Data en scores worden elke {CACHE_TTL} seconden automatisch herberekend.")
 st.sidebar.markdown("---")
 st.sidebar.caption(
     "⚠️ Uitsluitend educatief/informatief. Geen beleggingsadvies. "
@@ -439,6 +565,7 @@ st.sidebar.caption(
 
 st.title("🚀 Micro-Cap Breakout Radar & Screener")
 st.caption("Scant en rankt micro-caps op potentiële uitbraakkans (Breakout Score 0-100)")
+render_refresh_timer(CACHE_TTL, st.session_state.last_refresh)
 
 tab1, tab2, tab3 = st.tabs(
     ["📡 Realtime Screener & Top Picks", "📈 Technische Analyse", "🧪 Backtest Simulator"]
